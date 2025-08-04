@@ -230,7 +230,7 @@ def retrieve_chunks(query, query_embedding, top_k=10):
 @timing_decorator
 def generate_final_answer(context, question, source_info=None):
     print("Generating final answer with Google Gemini 1.5 Flash...")
-    model = genai.GenerativeModel('gemini-2.5-pro')
+    model = genai.GenerativeModel('gemini-1.5-flash')
     
     source_context = f"\n\nSource: {source_info.get('filename', 'Unknown')}" if source_info else ""
     
