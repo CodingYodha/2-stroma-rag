@@ -17,3 +17,5 @@ python-dotenv
 
 langchain-cohere
 langchain-text-splitters    
+
+python-multipart
