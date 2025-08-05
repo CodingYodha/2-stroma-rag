@@ -399,15 +399,22 @@ async def upload_document(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error uploading document: {e}")
 
+# Add this import at the top of your main.py
+import time
+from tqdm.auto import tqdm # For a nice progress bar
+import math
+
+# --- REPLACE YOUR OLD /api/v1/hackrx/run ENDPOINT WITH THIS NEW ONE ---
+
 @app.post("/api/v1/hackrx/run", response_model=HackathonResponse, tags=["Hackathon Submission"])
 def hackrx_webhook(request: HackathonRequest):
     """
-    This stateless endpoint downloads a PDF from a URL, processes it in memory,
-    and answers questions based on its content for the hackathon submission.
+    This stateless endpoint downloads a PDF, processes it in memory with rate-limiting,
+    and answers questions based on its content.
     """
     print("Received request on the official hackathon webhook endpoint.")
     
-    # 1. Get the PDF URL and questions from the request
+    # 1. Get the PDF URL and questions
     pdf_url = request.documents[0]
     questions = request.questions
     
@@ -415,55 +422,62 @@ def hackrx_webhook(request: HackathonRequest):
     try:
         print(f"Downloading PDF from: {pdf_url}")
         response = requests.get(pdf_url, timeout=30)
-        response.raise_for_status()  # Raise an exception for bad status codes
-        
+        response.raise_for_status()
         with fitz.open(stream=response.content, filetype="pdf") as doc:
             full_text = "".join(page.get_text() for page in doc)
         print("Successfully extracted text from PDF.")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to download or process PDF: {e}")
 
-    # 3. Create Parent and Child Chunks In-Memory
-    # (Using the semantic chunking strategy we developed)
+    # 3. Create Parent and Child Chunks
+    # ... (The chunking logic remains the same as before) ...
     def clause_chunker(document_text: str) -> list[str]:
         pattern = r'\n(?=\d+\.\d+\.|\d+\.|\([a-z]\)|\([ivx]+\))'
         return [clause for clause in re.split(pattern, document_text) if clause.strip()]
-
     parent_chunks_text = clause_chunker(full_text)
     parent_documents = [Document(page_content=text) for text in parent_chunks_text]
-    
     child_splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=50)
     child_documents = child_splitter.split_documents(parent_documents)
-
-    # 4. Create an In-Memory Vector Store (FAISS)
-    print("Creating in-memory FAISS vector store...")
+    
+    # 4. Create In-Memory Vector Store with Rate Limiting (NEW LOGIC)
+    print(f"Creating in-memory FAISS vector store for {len(child_documents)} chunks...")
     try:
-        retriever = FAISS.from_documents(child_documents, embedding_model).as_retriever()
+        batch_size = 32  # Process chunks in small batches
+        total_batches = math.ceil(len(child_documents) / batch_size)
+        vector_store = None
+
+        for i in tqdm(range(0, len(child_documents), batch_size), total=total_batches, desc="Embedding Chunks"):
+            batch = child_documents[i : i + batch_size]
+            
+            if vector_store is None:
+                # Create the store with the first batch
+                vector_store = FAISS.from_documents(batch, embedding_model)
+            else:
+                # Add subsequent batches to the existing store
+                vector_store.add_documents(batch)
+            
+            # Wait for a short period to respect API rate limits
+            time.sleep(1) # Sleep for 1 second between batches
+
+        retriever = vector_store.as_retriever()
+        print("FAISS vector store created successfully.")
     except Exception as e:
+        # If an error occurs, include the error message in the response for debugging
         raise HTTPException(status_code=500, detail=f"Failed to create embeddings or vector store: {e}")
     
-    # 5. Process Each Question
+    # 5. Process Each Question (This logic remains the same)
+    # ...
     final_answers = []
     for query in questions:
-        print(f"Processing query: '{query}'")
-        
-        # Retrieve relevant child documents from the in-memory store
+        # ... (rest of the function is the same as before) ...
         retrieved_docs = retriever.get_relevant_documents(query)
-        
-        # Rerank the retrieved documents
-        reranked_docs = cohere_reranker.compress_documents(
-            documents=retrieved_docs,
-            query=query
-        )
-        
+        reranked_docs = cohere_reranker.compress_documents(documents=retrieved_docs, query=query)
         if not reranked_docs:
             answer = "Could not find a relevant answer in the document."
         else:
             best_context = reranked_docs[0].page_content
-            # Generate the final answer from the best context
             response = generate_final_answer(best_context, query)
             answer = response.get("answer", "Failed to generate an answer.")
-        
         final_answers.append(answer)
 
     print("Finished processing all questions.")
