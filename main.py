@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 import time
+from loguru import logger
 import requests
 import json
 import csv
@@ -417,6 +418,7 @@ def hackrx_webhook(request: HackathonRequest):
     from a URL and answer questions about it.
     """
     # Generate a unique, temporary name for the Pinecone index
+    logger.info(f"Received request with {len(request.questions)} questions.")
     temp_index_name = f"hackathon-job-{uuid.uuid4().hex[:10]}"
     index = None
 
@@ -426,13 +428,13 @@ def hackrx_webhook(request: HackathonRequest):
         questions = request.questions
 
         # 2. Download and Extract Text from the PDF
-        print(f"Downloading PDF from: {pdf_url}")
+        logger.info(f"Downloading PDF from: {pdf_url}") # <-- Loguru change
         # ... (This logic remains the same)
         response = requests.get(pdf_url, timeout=30)
         response.raise_for_status()
         with fitz.open(stream=response.content, filetype="pdf") as doc:
             full_text = "".join(page.get_text() for page in doc)
-        print("Successfully extracted text from PDF.")
+        logger.success("Successfully extracted text from PDF.")
 
         # 3. Create Parent and Child Chunks
         # ... (The semantic chunking logic remains the same)
@@ -445,7 +447,7 @@ def hackrx_webhook(request: HackathonRequest):
         child_documents = child_splitter.split_documents(parent_documents)
 
         # 4. Create and Populate the Temporary Pinecone Index
-        print(f"Creating temporary Pinecone index: {temp_index_name}")
+        logger.info(f"Creating temporary Pinecone index: {temp_index_name}")
         pc.create_index(
             name=temp_index_name,
             dimension=DIMENSION, # Ensure this matches your embedding model
@@ -456,7 +458,7 @@ def hackrx_webhook(request: HackathonRequest):
             time.sleep(1)
         index = pc.Index(temp_index_name)
 
-        print(f"Embedding and upserting {len(child_documents)} chunks...")
+        logger.info(f"Embedding and upserting {len(child_documents)} chunks...")
         batch_size = 64
         for i in range(0, len(child_documents), batch_size):
             batch_end = min(i + batch_size, len(child_documents))
@@ -486,17 +488,17 @@ def hackrx_webhook(request: HackathonRequest):
                 answer = response.get("answer", "Failed to generate an answer.")
             final_answers.append(answer)
 
-        print("Finished processing all questions.")
+        logger.success("Finished processing all questions.")
         return HackathonResponse(answers=final_answers)
 
     except Exception as e:
-        print(f"An error occurred: {e}")
+        logger.exception("An error occurred during webhook processing.") 
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
         # 6. CRITICAL: Clean up and delete the temporary index
         if index and temp_index_name in pc.list_indexes().names():
-            print(f"Cleaning up and deleting temporary index: {temp_index_name}")
+            logger.warning(f"Cleaning up and deleting temporary index: {temp_index_name}")
             pc.delete_index(temp_index_name)
 
 

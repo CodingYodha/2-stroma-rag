@@ -23,3 +23,5 @@ python-multipart
 requests
 faiss-cpu
 uuid
+
+Loguru
