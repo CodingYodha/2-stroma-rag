@@ -7,6 +7,7 @@ import requests
 import json
 import csv
 import os
+import fitz
 from langchain_core.documents import Document
 import numpy as np
 import psycopg2
