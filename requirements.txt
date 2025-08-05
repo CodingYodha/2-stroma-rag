@@ -7,12 +7,12 @@ pinecone
 pinecone-text
 
 
-accelerate
+
 PyMuPDF
 numpy
 
 google-generativeai
-einops
+
 python-dotenv
 
 langchain-cohere
