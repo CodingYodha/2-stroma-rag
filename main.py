@@ -19,7 +19,7 @@ import hashlib
 from datetime import datetime
 from langchain_community.embeddings import JinaEmbeddings
 from langchain_community.vectorstores import FAISS
-
+import re
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from pinecone import Pinecone
