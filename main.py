@@ -275,7 +275,7 @@ def generate_final_answer(context, question, source_info=None):
 
 # === 7. FASTAPI DATA MODELS ===
 class HackathonRequest(BaseModel):
-    documents: List[str]
+    documents: str
     questions: List[str]
 
 class HackathonResponse(BaseModel):
