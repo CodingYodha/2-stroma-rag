@@ -20,7 +20,7 @@ from langchain_community.embeddings import JinaEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from pinecone import Pinecone
-
+from langchain_core.documents import Document
 import google.generativeai as genai
 from langchain_cohere import CohereRerank
 from langchain.retrievers.contextual_compression import ContextualCompressionRetriever
@@ -77,7 +77,10 @@ def get_db_connection():
 # === 4. GLOBAL OBJECTS (Load models once at startup) ===
 try:
 
-    
+    print("Loading document store...")
+    with open("docstore.json", "r", encoding="utf-8") as f:
+        docstore = json.load(f)
+    print("Document store loaded successfully.")
     print("Loading models and connecting to services...")
 
     
@@ -121,7 +124,7 @@ def timing_decorator(func):
     return wrapper
 
 class SimilarityCache:
-    def __init__(self, similarity_threshold=0.90):
+    def __init__(self, similarity_threshold=0.93):
         self.cache = []
         self.similarity_threshold = similarity_threshold
 
@@ -177,60 +180,51 @@ def get_chunk_details_from_postgres(pinecone_ids):
 
 # === 6. CORE RAG PIPELINE FUNCTIONS ===
 @timing_decorator
-def retrieve_chunks(query, query_embedding, top_k=10):
-    """Retrieve chunks from Pinecone using HYBRID search if supported, otherwise dense search."""
+def retrieve_chunks(query, query_embedding, top_k=5):
+    """
+    Retrieve relevant PARENT chunks.
+    1. Query Pinecone for the most relevant CHILD chunks.
+    2. Get the parent_id from the metadata of the child chunks.
+    3. Use the docstore to look up the full text of the parent chunks.
+    """
     try:
-        if USE_SPARSE_VECTORS and sparse_encoder:
-            # Hybrid search with both dense and sparse vectors
-            sparse_vector = sparse_encoder.encode_queries(query)
-            results = index.query(
-                vector=query_embedding,
-                sparse_vector=sparse_vector,
-                top_k=top_k,
-                include_metadata=True
-            )
-        else:
-            # Dense-only search (fallback)
-            results = index.query(
-                vector=query_embedding,
-                top_k=top_k,
-                include_metadata=True
-            )
+        # 1. Query Pinecone for child chunks
+        results = index.query(
+            vector=query_embedding,
+            top_k=top_k, # Retrieve a few child chunks to find unique parents
+            include_metadata=True
+        )
         
-        # Get additional details from PostgreSQL
-        pinecone_ids = [match['id'] for match in results['matches']]
-        chunk_details = get_chunk_details_from_postgres(pinecone_ids)
-        
-        chunks = []
+        # 2. Get unique parent IDs from the results
+        unique_parent_ids = set()
         for match in results['matches']:
-            chunk_id = match['id']
-            chunk_text = match['metadata']['text']
-            
-            # Add additional context from PostgreSQL if available
-            if chunk_id in chunk_details:
-                detail = chunk_details[chunk_id]
-                chunk_info = {
-                    'text': chunk_text,
-                    'filename': detail['filename'],
-                    'score': match['score'],
-                    'metadata': detail['metadata']
-                }
-                chunks.append(chunk_info)
-            else:
-                chunks.append({'text': chunk_text, 'score': match['score']})
+            if match['metadata'].get('parent_id'):
+                unique_parent_ids.add(match['metadata']['parent_id'])
+
+        # 3. Look up parent chunks from the docstore
+        parent_chunks = []
+        for pid in unique_parent_ids:
+            if pid in docstore:
+                # Find the original filename and doc_id from the first match
+                original_metadata = next((m['metadata'] for m in results['matches'] if m['metadata'].get('parent_id') == pid), {})
+                
+                parent_chunks.append({
+                    'text': docstore[pid],
+                    'filename': original_metadata.get('filename'),
+                    'document_id': original_metadata.get('document_id')
+                })
         
-        return chunks
+        return parent_chunks
     
     except Exception as e:
         print(f"Error in retrieve_chunks: {e}")
         return []
 
 
-
 @timing_decorator
 def generate_final_answer(context, question, source_info=None):
     print("Generating final answer with Google Gemini 1.5 Flash...")
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    model = genai.GenerativeModel('gemini-2.5-pro')
     
     source_context = f"\n\nSource: {source_info.get('filename', 'Unknown')}" if source_info else ""
     

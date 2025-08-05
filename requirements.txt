@@ -16,3 +16,4 @@ einops
 python-dotenv
 peft
 langchain-cohere
+langchain-text-splitters

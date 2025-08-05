@@ -10,6 +10,7 @@ from tqdm.auto import tqdm
 import math
 import hashlib
 import psycopg2
+from langchain_core.documents import Document
 from psycopg2.extras import RealDictCursor # <-- ADD THIS LINE
 import os
 from dotenv import load_dotenv
@@ -241,6 +242,12 @@ def store_chunks_in_postgres_and_pinecone(document_id, chunks, index):
             conn.rollback()
         return False
 
+def clause_chunker(document_text: str) -> list[str]:
+    """Splits a document based on section headers (e.g., 3.1, 4.2, a.)."""
+    pattern = r'\n(?=\d+\.\d+\.|\d+\.|\([a-z]\)|\([ivx]+\))'
+    clauses = re.split(pattern, document_text)
+        # Filter out any empty strings that might result from the split
+    return [clause for clause in clauses if clause.strip()]
 
 # --- 3. MAIN INGESTION SCRIPT ---
 if __name__ == "__main__":
@@ -258,12 +265,37 @@ if __name__ == "__main__":
         exit()
     
     filename = os.path.basename(PDF_PATH)
-    
+    full_text = content
     # Check if this document version has already been processed
     document_id, is_new = store_document_in_postgres(filename, content)
     if not is_new:
         print("This document has already been ingested. To re-ingest, please delete it via the API first.")
         exit()
+
+#=============parent child chunking and ingestion =====================
+    # 1. Create a LangChain Document object for the entire PDF content
+    
+
+
+
+    # 2a. Define the semantic chunker function to create parent chunks by section
+
+    # 2b. Create parent chunks by splitting the document along semantic boundaries
+    print("Creating semantic parent chunks...")
+    parent_chunks_text = clause_chunker(full_text) # Use the full_text variable
+    
+    # 2c. Convert the raw text chunks into LangChain Document objects
+    parent_documents = []
+    for text_chunk in parent_chunks_text:
+        parent_documents.append(Document(
+            page_content=text_chunk,
+            metadata={
+                "filename": filename,
+                "document_id": document_id
+            }
+        ))
+    
+    child_splitter = RecursiveCharacterTextSplitter(chunk_size=400 , chunk_overlap=50)
 
     # Create or Recreate Pinecone Index if needed (optional, you can manage this manually)
     pc = Pinecone(api_key=PINECONE_API_KEY)
@@ -279,16 +311,51 @@ if __name__ == "__main__":
             time.sleep(1)
     
     index = pc.Index(PINECONE_INDEX_NAME)
-    print("Pinecone index is ready.")
+    embedding_model=JinaEmbeddings(model_name=EMBEDDING_MODEL, jina_api_key=JINA_API_KEY)
 
-    # Chunk the text
-# NEW
-    chunks = clause_chunker(content)
-    print(f"Created {len(chunks)} chunks from document.")
+    #4 create parent/child chunks and a document to store for context lookup
+    print("Creating child chunks.....")
 
-    # Store chunks in PostgreSQL and vectors in Pinecone
-    success = store_chunks_in_postgres_and_pinecone(document_id, chunks, index)
-    if success:
-        print("Ingestion complete. Document is now available for querying.")
-    else:
-        print("Ingestion failed.")
+    child_documents = []
+    docstore = {}
+
+    for i, p_doc in enumerate(parent_documents):
+        parent_id = f"parent_{document_id}_{i}"
+        child_chunks = child_splitter.split_documents([p_doc])
+        for child_chunk in child_chunks:
+            child_chunk.metadata["parent_id"] = parent_id
+            child_documents.append(child_chunk)
+        docstore[parent_id] = p_doc.page_content
+
+    #5. Embed and upsert only child chunks to Pinecone
+    print(f"Embedding and upserting {len(child_documents)} child chunks to Pinecone.....")
+    batch_size = 64
+    total_batches = math.ceil(len(child_documents)/batch_size)
+
+    for i in tqdm(range(0, len(child_documents), batch_size), total=total_batches, desc="Upserting Child Chunks"):
+        batch_end = min(i + batch_size, len(child_documents))
+        batch = child_documents[i:batch_end]
+        
+        texts_to_embed = [doc.page_content for doc in batch]
+        embeds = embedding_model.embed_documents(texts_to_embed)
+        
+        vectors_to_upsert = []
+        for k, doc in enumerate(batch):
+            # Create a unique ID for each child chunk for potential future reference
+            child_id = f"child_{document_id}_{i+k}"
+            vectors_to_upsert.append({
+                'id': child_id,
+                'values': embeds[k],
+                'metadata': doc.metadata
+            })
+        index.upsert(vectors=vectors_to_upsert)
+
+    #6. save the parent chunk document store to a json file
+    with open("docstore.json", "w", encoding="utf-8") as f:
+        json.dump(docstore, f, ensure_ascii=False, indent=4)
+
+
+    print("\n=====Ingestion complete=======")
+    print(f"Successfully created 'docstore.json' with {len(docstore)} parent chunks.")
+    print(f"Pinecone index '{PINECONE_INDEX_NAME}' is populated with {len(child_documents)} child vectors.")
+
