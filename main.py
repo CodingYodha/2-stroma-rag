@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 import time
+import requests
 import json
 import csv
 import os
@@ -16,6 +17,7 @@ from typing import List, Optional
 import hashlib
 from datetime import datetime
 from langchain_community.embeddings import JinaEmbeddings
+from langchain_community.vectorstores import FAISS
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -270,6 +272,13 @@ def generate_final_answer(context, question, source_info=None):
 
 
 # === 7. FASTAPI DATA MODELS ===
+class HackathonRequest(BaseModel):
+    documents: List[str]
+    questions: List[str]
+
+class HackathonResponse(BaseModel):
+    answers: List[str]
+
 class QueryRequest(BaseModel):
     query: str = Field(..., example="What is the waiting period for pre-existing diseases?")
 
@@ -388,6 +397,76 @@ async def upload_document(file: UploadFile = File(...)):
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error uploading document: {e}")
+
+@app.post("/api/v1/hackrx/run", response_model=HackathonResponse, tags=["Hackathon Submission"])
+def hackrx_webhook(request: HackathonRequest):
+    """
+    This stateless endpoint downloads a PDF from a URL, processes it in memory,
+    and answers questions based on its content for the hackathon submission.
+    """
+    print("Received request on the official hackathon webhook endpoint.")
+    
+    # 1. Get the PDF URL and questions from the request
+    pdf_url = request.documents[0]
+    questions = request.questions
+    
+    # 2. Download and Extract Text from the PDF
+    try:
+        print(f"Downloading PDF from: {pdf_url}")
+        response = requests.get(pdf_url, timeout=30)
+        response.raise_for_status()  # Raise an exception for bad status codes
+        
+        with fitz.open(stream=response.content, filetype="pdf") as doc:
+            full_text = "".join(page.get_text() for page in doc)
+        print("Successfully extracted text from PDF.")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to download or process PDF: {e}")
+
+    # 3. Create Parent and Child Chunks In-Memory
+    # (Using the semantic chunking strategy we developed)
+    def clause_chunker(document_text: str) -> list[str]:
+        pattern = r'\n(?=\d+\.\d+\.|\d+\.|\([a-z]\)|\([ivx]+\))'
+        return [clause for clause in re.split(pattern, document_text) if clause.strip()]
+
+    parent_chunks_text = clause_chunker(full_text)
+    parent_documents = [Document(page_content=text) for text in parent_chunks_text]
+    
+    child_splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=50)
+    child_documents = child_splitter.split_documents(parent_documents)
+
+    # 4. Create an In-Memory Vector Store (FAISS)
+    print("Creating in-memory FAISS vector store...")
+    try:
+        retriever = FAISS.from_documents(child_documents, embedding_model).as_retriever()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create embeddings or vector store: {e}")
+    
+    # 5. Process Each Question
+    final_answers = []
+    for query in questions:
+        print(f"Processing query: '{query}'")
+        
+        # Retrieve relevant child documents from the in-memory store
+        retrieved_docs = retriever.get_relevant_documents(query)
+        
+        # Rerank the retrieved documents
+        reranked_docs = cohere_reranker.compress_documents(
+            documents=retrieved_docs,
+            query=query
+        )
+        
+        if not reranked_docs:
+            answer = "Could not find a relevant answer in the document."
+        else:
+            best_context = reranked_docs[0].page_content
+            # Generate the final answer from the best context
+            response = generate_final_answer(best_context, query)
+            answer = response.get("answer", "Failed to generate an answer.")
+        
+        final_answers.append(answer)
+
+    print("Finished processing all questions.")
+    return HackathonResponse(answers=final_answers)
 
 
 @app.post("/ask", response_model=AnswerResponse)

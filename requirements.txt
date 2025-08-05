@@ -19,3 +19,6 @@ langchain-cohere
 langchain-text-splitters    
 
 python-multipart
+
+requests
+faiss-cpu
