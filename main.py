@@ -21,13 +21,13 @@ from langchain_community.embeddings import JinaEmbeddings
 from langchain_community.vectorstores import FAISS
 import re
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-
+from pinecone import Pinecone, ServerlessSpec
 from pinecone import Pinecone
 from langchain_core.documents import Document
 import google.generativeai as genai
 from langchain_cohere import CohereRerank
 from langchain.retrievers.contextual_compression import ContextualCompressionRetriever
-
+import uuid 
 
 import tempfile 
 import asyncio
@@ -226,7 +226,7 @@ def retrieve_chunks(query, query_embedding, top_k=5):
 
 @timing_decorator
 def generate_final_answer(context, question, source_info=None):
-    print("Generating final answer with Google Gemini 1.5 Flash...")
+    print("Generating final answer with Google Gemini 2.5 pro...")
     model = genai.GenerativeModel('gemini-2.5-pro')
     
     source_context = f"\n\nSource: {source_info.get('filename', 'Unknown')}" if source_info else ""
@@ -406,82 +406,99 @@ import math
 
 # --- REPLACE YOUR OLD /api/v1/hackrx/run ENDPOINT WITH THIS NEW ONE ---
 
+
+
+
+
 @app.post("/api/v1/hackrx/run", response_model=HackathonResponse, tags=["Hackathon Submission"])
 def hackrx_webhook(request: HackathonRequest):
     """
-    This stateless endpoint downloads a PDF, processes it in memory with rate-limiting,
-    and answers questions based on its content.
+    This stateless endpoint uses a temporary Pinecone index to process a PDF
+    from a URL and answer questions about it.
     """
-    print("Received request on the official hackathon webhook endpoint.")
-    
-    # 1. Get the PDF URL and questions
-    pdf_url = request.documents[0]
-    questions = request.questions
-    
-    # 2. Download and Extract Text from the PDF
+    # Generate a unique, temporary name for the Pinecone index
+    temp_index_name = f"hackathon-job-{uuid.uuid4().hex[:10]}"
+    index = None
+
     try:
+        # 1. Get the PDF URL and questions
+        pdf_url = request.documents[0]
+        questions = request.questions
+
+        # 2. Download and Extract Text from the PDF
         print(f"Downloading PDF from: {pdf_url}")
+        # ... (This logic remains the same)
         response = requests.get(pdf_url, timeout=30)
         response.raise_for_status()
         with fitz.open(stream=response.content, filetype="pdf") as doc:
             full_text = "".join(page.get_text() for page in doc)
         print("Successfully extracted text from PDF.")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to download or process PDF: {e}")
 
-    # 3. Create Parent and Child Chunks
-    # ... (The chunking logic remains the same as before) ...
-    def clause_chunker(document_text: str) -> list[str]:
-        pattern = r'\n(?=\d+\.\d+\.|\d+\.|\([a-z]\)|\([ivx]+\))'
-        return [clause for clause in re.split(pattern, document_text) if clause.strip()]
-    parent_chunks_text = clause_chunker(full_text)
-    parent_documents = [Document(page_content=text) for text in parent_chunks_text]
-    child_splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=50)
-    child_documents = child_splitter.split_documents(parent_documents)
-    
-    # 4. Create In-Memory Vector Store with Rate Limiting (NEW LOGIC)
-    print(f"Creating in-memory FAISS vector store for {len(child_documents)} chunks...")
-    try:
-        batch_size = 32  # Process chunks in small batches
-        total_batches = math.ceil(len(child_documents) / batch_size)
-        vector_store = None
+        # 3. Create Parent and Child Chunks
+        # ... (The semantic chunking logic remains the same)
+        def clause_chunker(document_text: str) -> list[str]:
+            pattern = r'\n(?=\d+\.\d+\.|\d+\.|\([a-z]\)|\([ivx]+\))'
+            return [clause for clause in re.split(pattern, document_text) if clause.strip()]
+        parent_chunks_text = clause_chunker(full_text)
+        parent_documents = [Document(page_content=text) for text in parent_chunks_text]
+        child_splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=50)
+        child_documents = child_splitter.split_documents(parent_documents)
 
-        for i in tqdm(range(0, len(child_documents), batch_size), total=total_batches, desc="Embedding Chunks"):
-            batch = child_documents[i : i + batch_size]
+        # 4. Create and Populate the Temporary Pinecone Index
+        print(f"Creating temporary Pinecone index: {temp_index_name}")
+        pc.create_index(
+            name=temp_index_name,
+            dimension=DIMENSION, # Ensure this matches your embedding model
+            metric="dotproduct",
+            spec=ServerlessSpec(cloud="aws", region="us-east-1")
+        )
+        while not pc.describe_index(temp_index_name).status['ready']:
+            time.sleep(1)
+        index = pc.Index(temp_index_name)
+
+        print(f"Embedding and upserting {len(child_documents)} chunks...")
+        batch_size = 64
+        for i in range(0, len(child_documents), batch_size):
+            batch_end = min(i + batch_size, len(child_documents))
+            batch = child_documents[i:batch_end]
+            texts_to_embed = [doc.page_content for doc in batch]
+            embeds = embedding_model.embed_documents(texts_to_embed)
+            vectors_to_upsert = [{'id': f'chunk_{i+k}', 'values': embeds[k], 'metadata': {'text': doc.page_content}} for k, doc in enumerate(batch)]
+            index.upsert(vectors=vectors_to_upsert)
+        
+        # 5. Process Each Question
+        final_answers = []
+        for query in questions:
+            print(f"Processing query: '{query}'")
+            query_embedding = embedding_model.embed_query(query)
             
-            if vector_store is None:
-                # Create the store with the first batch
-                vector_store = FAISS.from_documents(batch, embedding_model)
+            # Retrieve from the temporary Pinecone index
+            retrieved_chunks = index.query(vector=query_embedding, top_k=5, include_metadata=True)
+            retrieved_docs = [Document(page_content=match['metadata']['text']) for match in retrieved_chunks['matches']]
+
+            # Rerank and Generate
+            reranked_docs = cohere_reranker.compress_documents(documents=retrieved_docs, query=query)
+            if not reranked_docs:
+                answer = "Could not find a relevant answer in the document."
             else:
-                # Add subsequent batches to the existing store
-                vector_store.add_documents(batch)
-            
-            # Wait for a short period to respect API rate limits
-            time.sleep(1) # Sleep for 1 second between batches
+                best_context = reranked_docs[0].page_content
+                response = generate_final_answer(best_context, query)
+                answer = response.get("answer", "Failed to generate an answer.")
+            final_answers.append(answer)
 
-        retriever = vector_store.as_retriever()
-        print("FAISS vector store created successfully.")
+        print("Finished processing all questions.")
+        return HackathonResponse(answers=final_answers)
+
     except Exception as e:
-        # If an error occurs, include the error message in the response for debugging
-        raise HTTPException(status_code=500, detail=f"Failed to create embeddings or vector store: {e}")
-    
-    # 5. Process Each Question (This logic remains the same)
-    # ...
-    final_answers = []
-    for query in questions:
-        # ... (rest of the function is the same as before) ...
-        retrieved_docs = retriever.get_relevant_documents(query)
-        reranked_docs = cohere_reranker.compress_documents(documents=retrieved_docs, query=query)
-        if not reranked_docs:
-            answer = "Could not find a relevant answer in the document."
-        else:
-            best_context = reranked_docs[0].page_content
-            response = generate_final_answer(best_context, query)
-            answer = response.get("answer", "Failed to generate an answer.")
-        final_answers.append(answer)
+        print(f"An error occurred: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-    print("Finished processing all questions.")
-    return HackathonResponse(answers=final_answers)
+    finally:
+        # 6. CRITICAL: Clean up and delete the temporary index
+        if index and temp_index_name in pc.list_indexes().names():
+            print(f"Cleaning up and deleting temporary index: {temp_index_name}")
+            pc.delete_index(temp_index_name)
+
 
 
 @app.post("/ask", response_model=AnswerResponse)
