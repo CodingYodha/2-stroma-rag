@@ -424,7 +424,7 @@ def hackrx_webhook(request: HackathonRequest):
 
     try:
         # 1. Get the PDF URL and questions
-        pdf_url = request.documents[0]
+        pdf_url = request.documents
         questions = request.questions
 
         # 2. Download and Extract Text from the PDF
