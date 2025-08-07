@@ -232,6 +232,14 @@ def generate_final_answer(context, question, source_info=None):
     
     source_context = f"\n\nSource: {source_info.get('filename', 'Unknown')}" if source_info else ""
     
+    safety_settings = {
+        HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+    }
+
+
     prompt = f"""
 **Role:** You are an expert AI assistant specialized in accurately interpreting documents.
 
@@ -258,14 +266,17 @@ def generate_final_answer(context, question, source_info=None):
 **Helpful Answer:**
 """
     try:
-        response = model.generate_content(prompt)
+        response = model.generate_content(prompt, safety_settings=safety_settings)
+        if not response.parts:
+            # This can happen if the prompt itself is blocked
+            raise ValueError("Response was empty, possibly blocked by API safety filters despite settings.")
         return {
             "answer": response.text.strip(), 
             "source_context": context,
             "source_info": source_info or {}
         }
     except Exception as e:
-        print(f"Error during Gemini API call: {e}")
+        logger.exception(f"Error during Gemini API call: {question} , error : {e}")
         return {
             "answer": "There was an error generating the answer.", 
             "source_context": context,
