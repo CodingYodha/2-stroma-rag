@@ -28,6 +28,7 @@ from langchain_core.documents import Document
 import google.generativeai as genai
 from langchain_cohere import CohereRerank
 from langchain.retrievers.contextual_compression import ContextualCompressionRetriever
+from google.generativeai.types import HarmCategory, HarmBlockThreshold
 import uuid 
 
 import tempfile 
